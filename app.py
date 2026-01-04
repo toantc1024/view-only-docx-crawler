@@ -14,7 +14,32 @@ import os
 st.set_page_config(page_title="Google Doc Crawler", layout="wide")
 
 st.title("Google Doc to Word Crawler")
-st.write("Convert 'view only' Google Docs to editable Word documents with formatting (Bold, Highlights, Images, etc.)")
+st.markdown("Convert 'view only' Google Docs to editable Word documents with formatting (Bold, Highlights, Images, etc.)")
+
+# --- Tutorial & Footer ---
+
+@st.dialog("Tutorial")
+def show_tutorial():
+    st.markdown("""
+    ### User Guide (Tutorial)
+    
+    **1. Single URL**
+    *   Paste the Google Doc link (View only permissions).
+    *   Select **Use Custom Filename** if you want to name the file yourself.
+    *   Click **Convert & Download**.
+    
+    **2. Multiple URLs (Batch)**
+    *   Paste a list of links (one per line).
+    *   The system will download all of them and compress them into a ZIP file.
+    
+    **3. Google Drive Folder**
+    *   Paste the Google Drive folder link (Must be Public).
+    *   Click **Scan Folder** to find Google Docs files.
+    *   Select **Process these documents** to download.
+    """)
+
+if st.button("Tutorial"):
+    show_tutorial()
 
 # Helper function to hex to RGB
 def hex_to_rgb(hex_color):
@@ -193,10 +218,62 @@ def crawl_and_get_doc_object(url):
             
     return doc, title, None
 
-# --- UI ---
+# --- Drive Folder Logic ---
 
-st.write("---")
-input_mode = st.radio("Input Mode", ["Single URL", "Multiple URLs (Batch)"])
+def get_drive_folder_id(url):
+    # Matches .../folders/FOLDER_ID... or ?id=FOLDER_ID
+    # Standard: https://drive.google.com/drive/folders/1Qs0q7Pw-oepNUoz8DaIjhPrXP2gVLAiy
+    match = re.search(r'folders/([a-zA-Z0-9_-]+)', url)
+    if match:
+        return match.group(1)
+    match = re.search(r'[?&]id=([a-zA-Z0-9_-]+)', url)
+    if match:
+        return match.group(1)
+    return None
+
+def scan_drive_folder(folder_id):
+    # Use the embedded view which is server-side rendered (usually)
+    url = f"https://drive.google.com/embeddedfolderview?id={folder_id}"
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.content, 'html.parser')
+        
+        links = []
+        # The embedded view lists items as <a> tags directly or in rows
+        for a in soup.find_all('a', href=True):
+            href = a['href']
+            # We are looking for /document/d/ID or /file/d/ID (if it's a docx viewable)
+            # Normal docs: https://docs.google.com/document/d/ID/edit...
+            # Drive files: https://drive.google.com/file/d/ID/view...
+            
+            # Extract ID
+            doc_id = None
+            if '/document/d/' in href:
+                doc_id = href.split('/document/d/')[1].split('/')[0]
+                full_link = f"https://docs.google.com/document/d/{doc_id}/edit"
+                links.append(full_link)
+            elif '/file/d/' in href:
+                # Some might be PDFs or images, but user specifically wants docx/docs
+                # We can try to crawl them if they are Google Docs wrapped in Drive UI
+                # But typically /file/d/ are binary files. 
+                # If the user says "From doc gg to docx", they imply Google Docs native format.
+                # However, the user also mentioned "MÔN SẢN PHỤ KHOA YDS 2024.docx" in the drive list.
+                # That is a literal .docx file hosted on Drive. 
+                # This crawler is designed for NATIVE Google Docs -> HTML -> Docx.
+                # It cannot convert a binary .docx hosted on Drive (we would just download it).
+                # For now, let's strictly support Google Docs (native).
+                # Sidenote: The user said "MÔN SẢN PHỤ KHOA YDS 2024.docx" was in the list.
+                # If it's already a docx, we could just direct download it?
+                # For this specific task "Crawler", I will stick to converting Google Docs (the "View Only" native ones).
+                pass
+                
+        return list(set(links)) # Unique
+    except Exception as e:
+        st.error(f"Error scanning folder: {e}")
+        return []
+
+input_mode = st.radio("Input Mode", ["Single URL", "Multiple URLs (Batch)", "Google Drive Folder"])
 
 urls_to_process = []
 
@@ -204,10 +281,34 @@ if input_mode == "Single URL":
     url_input = st.text_input("Google Doc URL", "https://docs.google.com/document/d/1lfQQ4-niDDeErUhWrL-NQ646uirpNBVFNNeBYQ5L35k/edit?tab=t.0")
     if url_input:
         urls_to_process.append(url_input)
-else:
+
+elif input_mode == "Multiple URLs (Batch)":
     multi_input = st.text_area("Enter Google Doc URLs (one per line)", height=150)
     if multi_input:
         urls_to_process = [u.strip() for u in multi_input.split('\n') if u.strip()]
+
+elif input_mode == "Google Drive Folder":
+    folder_url = st.text_input("Google Drive Folder URL", "https://drive.google.com/drive/folders/1Qs0q7Pw-oepNUoz8DaIjhPrXP2gVLAiy")
+    if folder_url and st.button("Scan Folder"):
+        folder_id = get_drive_folder_id(folder_url)
+        if folder_id:
+            with st.spinner(f"Scanning folder ID: {folder_id}..."):
+                found_links = scan_drive_folder(folder_id)
+                if found_links:
+                    st.success(f"Found {len(found_links)} documents!")
+                    st.session_state['scanned_links'] = found_links
+                else:
+                    st.warning("No Google Docs found in this folder (or folder is not public).")
+        else:
+            st.error("Invalid Folder URL")
+
+    # Use session state to persist scanned links
+    if 'scanned_links' in st.session_state:
+        st.write("Documents found:")
+        st.code('\n'.join(st.session_state['scanned_links']))
+        if st.checkbox("Process these documents?", value=True):
+            urls_to_process = st.session_state['scanned_links']
+
 
 use_custom_name = st.checkbox("Use Custom Filename (for Single URL only)")
 custom_filename = ""
@@ -249,13 +350,17 @@ if st.button("Convert & Download"):
                 bio = io.BytesIO()
                 item['doc'].save(bio)
                 
-                final_name = item['title'] + ".docx"
+                # Fix regex/naming issue
+                raw_name = item['title']
+                
                 if use_custom_name and custom_filename:
                     final_name = custom_filename
-                    if not final_name.endswith('.docx'):
-                        final_name += ".docx"
                 else:
-                    final_name = sanitize_filename(final_name) + ".docx"
+                    final_name = sanitize_filename(raw_name)
+                
+                # Ensure exactly one extension
+                if not final_name.lower().endswith('.docx'):
+                    final_name += ".docx"
                 
                 st.download_button(
                     label=f"Download {final_name}",
@@ -272,9 +377,12 @@ if st.button("Convert & Download"):
                         doc_bio = io.BytesIO()
                         item['doc'].save(doc_bio)
                         
-                        fname = sanitize_filename(item['title']) + ".docx"
+                        safe_title = sanitize_filename(item['title'])
+                        fname = f"{safe_title}.docx"
+                        
                         # Handle duplicate filenames in zip
-                        # (Simple logic: if exists, append number - not implemented for brevity, assuming unique titles or rare collision)
+                        # We can just increment if collision? 
+                        # For now, simplistic approach.
                         zip_file.writestr(fname, doc_bio.getvalue())
                 
                 st.download_button(
@@ -283,3 +391,7 @@ if st.button("Convert & Download"):
                     file_name="converted_docs.zip",
                     mime="application/zip"
                 )
+
+
+
+st.markdown("<div style='text-align: center; margin-top: 50px;'><a href='https://www.facebook.com/deno.jsr' target='_blank' style='text-decoration: none; color: #888; font-weight: bold;'>Made with 💖 by Tran Cong Toan</a></div>", unsafe_allow_html=True)
