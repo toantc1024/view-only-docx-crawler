@@ -186,6 +186,12 @@ def crawl_and_get_doc_object(url):
     # Create Docx
     doc = Document()
     
+    # Set default font to Times New Roman
+    style = doc.styles['Normal']
+    font = style.font
+    font.name = 'Times New Roman'
+    font.size = Pt(12)
+    
     # ... (existing style parsing logic helper functions are global, need to make sure they are accessible or moved)
     # Re-using the logic from previous crawl_and_convert but splitting it to return doc object
     
